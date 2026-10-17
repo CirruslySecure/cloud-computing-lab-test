@@ -160,22 +160,196 @@ aws ec2 create-launch-template \
 --launch-template-data file://viewer-lt-data.json \
 --region "$AWS_REGION" > /dev/null
 fi
-echo "== Launching instances from the templates =="
-UPLOADER_ID=$(aws ec2 run-instances \
---launch-template "LaunchTemplateName=$UPLOADER_LT_NAME,Version=\$Latest" \
---count 1 \
---region "$AWS_REGION" \
---query "Instances[0].InstanceId" --output text)
-VIEWER_ID=$(aws ec2 run-instances \
---launch-template "LaunchTemplateName=$VIEWER_LT_NAME,Version=\$Latest" \
---count 1 \
---region "$AWS_REGION" \
---query "Instances[0].InstanceId" --output text)
-echo "$UPLOADER_ID" > uploader_instance_id.txt
-echo "$VIEWER_ID" > viewer_instance_id.txt
-echo "Waiting for both instances to reach 'running'..."
-aws ec2 wait instance-running --instance-ids "$UPLOADER_ID" "$VIEWER_ID" --region "$AWS_REGION"
-aws ec2 describe-instances --instance-ids "$UPLOADER_ID" "$VIEWER_ID" \
---query "Reservations[*].Instances[*].[Tags[?Key=='Name'].Value|[0],PublicIpAddress]" \
---output table --region "$AWS_REGION"
-echo "Instances are running. Give them ~60-90s to finish installing Node.js before browsing to :3000."
+
+echo "== Looking up VPC and subnets =="
+VPC_ID=$(aws ec2 describe-vpcs \
+    --filters "Name=isDefault,Values=true" \
+    --query "Vpcs[0].VpcId" \
+    --output text --region "$AWS_REGION")
+
+SUBNET_A=$(aws ec2 describe-subnets \
+    --filters "Name=vpc-id,Values=$VPC_ID" "Name=availability-zone,Values=$AZ_A" \
+    --query "Subnets[0].SubnetId" \
+    --output text --region "$AWS_REGION")
+
+SUBNET_B=$(aws ec2 describe-subnets \
+    --filters "Name=vpc-id,Values=$VPC_ID" "Name=availability-zone,Values=$AZ_B" \
+    --query "Subnets[0].SubnetId" \
+    --output text --region "$AWS_REGION")
+
+if [[ "$VPC_ID" == "None" || "$SUBNET_A" == "None" || "$SUBNET_B" == "None" ]]; then
+    echo "ERROR: VPC or subnet lookup failed."
+    exit 1
+fi
+
+APP_VPC_ID=$(aws ec2 describe-security-groups \
+    --group-ids "$APP_SECURITY_GROUP_ID" \
+    --query "SecurityGroups[0].VpcId" \
+    --output text --region "$AWS_REGION")
+
+if [[ "$APP_VPC_ID" != "$VPC_ID" ]]; then
+    echo "ERROR: Application security group is in a different VPC."
+    exit 1
+fi
+
+echo "== Creating ALB security group =="
+ALB_SECURITY_GROUP_ID=$(aws ec2 describe-security-groups \
+    --filters "Name=group-name,Values=$ALB_SG_NAME" "Name=vpc-id,Values=$VPC_ID" \
+    --query "SecurityGroups[0].GroupId" \
+    --output text --region "$AWS_REGION")
+
+if [[ "$ALB_SECURITY_GROUP_ID" == "None" ]]; then
+    ALB_SECURITY_GROUP_ID=$(aws ec2 create-security-group \
+        --group-name "$ALB_SG_NAME" \
+        --description "Application Load Balancer security group" \
+        --vpc-id "$VPC_ID" \
+        --query "GroupId" \
+        --output text --region "$AWS_REGION")
+fi
+
+for PORT in "$UPLOADER_LISTENER_PORT" "$VIEWER_LISTENER_PORT"; do
+    aws ec2 authorize-security-group-ingress \
+        --group-id "$ALB_SECURITY_GROUP_ID" \
+        --protocol tcp --port "$PORT" \
+        --cidr 0.0.0.0/0 \
+        --region "$AWS_REGION" >/dev/null 2>&1 || true
+done
+
+echo "== Tightening the app security group to only accept traffic from the ALB =="
+aws ec2 revoke-security-group-ingress --group-id "$APP_SECURITY_GROUP_ID" \
+    --protocol tcp --port 3000 --cidr 0.0.0.0/0 --region "$AWS_REGION" >/dev/null 2>&1 || true
+aws ec2 authorize-security-group-ingress --group-id "$APP_SECURITY_GROUP_ID" \
+    --protocol tcp --port 3000 --source-group "$ALB_SECURITY_GROUP_ID" --region "$AWS_REGION" >/dev/null 2>&1 || true
+
+echo "== Creating target groups =="
+create_target_group() {
+    local NAME="$1"
+    local ARN
+
+    ARN=$(aws elbv2 describe-target-groups \
+        --names "$NAME" \
+        --query "TargetGroups[0].TargetGroupArn" \
+        --output text --region "$AWS_REGION" 2>/dev/null) || ARN="None"
+
+    if [[ "$ARN" == "None" || -z "$ARN" ]]; then
+        ARN=$(aws elbv2 create-target-group \
+            --name "$NAME" \
+            --protocol HTTP --port 3000 \
+            --vpc-id "$VPC_ID" \
+            --target-type instance \
+            --health-check-protocol HTTP \
+            --health-check-path / \
+            --health-check-interval-seconds 10 \
+            --health-check-timeout-seconds 5 \
+            --healthy-threshold-count 2 \
+            --unhealthy-threshold-count 2 \
+            --query "TargetGroups[0].TargetGroupArn" \
+            --output text --region "$AWS_REGION")
+    fi
+
+    printf '%s\n' "$ARN"
+}
+
+UPLOADER_TG_ARN=$(create_target_group "$UPLOADER_TG_NAME")
+VIEWER_TG_ARN=$(create_target_group "$VIEWER_TG_NAME")
+
+echo "== Creating Application Load Balancer =="
+ALB_ARN=$(aws elbv2 describe-load-balancers \
+    --names "$ALB_NAME" \
+    --query "LoadBalancers[0].LoadBalancerArn" \
+    --output text --region "$AWS_REGION" 2>/dev/null) || ALB_ARN="None"
+
+if [[ "$ALB_ARN" == "None" || -z "$ALB_ARN" ]]; then
+    ALB_ARN=$(aws elbv2 create-load-balancer \
+        --name "$ALB_NAME" \
+        --subnets "$SUBNET_A" "$SUBNET_B" \
+        --security-groups "$ALB_SECURITY_GROUP_ID" \
+        --scheme internet-facing \
+        --type application \
+        --query "LoadBalancers[0].LoadBalancerArn" \
+        --output text --region "$AWS_REGION")
+fi
+
+aws elbv2 wait load-balancer-available \
+    --load-balancer-arns "$ALB_ARN" \
+    --region "$AWS_REGION"
+
+echo "== Creating listeners =="
+create_listener() {
+    local PORT="$1"
+    local TARGET_ARN="$2"
+    local EXISTING
+
+    EXISTING=$(aws elbv2 describe-listeners \
+        --load-balancer-arn "$ALB_ARN" \
+        --query "Listeners[?Port==\`$PORT\`].ListenerArn | [0]" \
+        --output text --region "$AWS_REGION")
+
+    if [[ "$EXISTING" == "None" || -z "$EXISTING" ]]; then
+        aws elbv2 create-listener \
+            --load-balancer-arn "$ALB_ARN" \
+            --protocol HTTP \
+            --port "$PORT" \
+            --default-actions "Type=forward,TargetGroupArn=$TARGET_ARN" \
+            --region "$AWS_REGION" >/dev/null
+    fi
+}
+
+create_listener "$UPLOADER_LISTENER_PORT" "$UPLOADER_TG_ARN"
+create_listener "$VIEWER_LISTENER_PORT" "$VIEWER_TG_ARN"
+
+ALB_DNS_NAME=$(aws elbv2 describe-load-balancers \
+    --load-balancer-arns "$ALB_ARN" \
+    --query "LoadBalancers[0].DNSName" \
+    --output text --region "$AWS_REGION")
+
+echo "== Creating Auto Scaling Groups =="
+create_asg() {
+    local NAME="$1"
+    local TEMPLATE="$2"
+    local TARGET_ARN="$3"
+    local APP_NAME="$4"
+    local EXISTING
+
+    EXISTING=$(aws autoscaling describe-auto-scaling-groups \
+        --auto-scaling-group-names "$NAME" \
+        --query "AutoScalingGroups[0].AutoScalingGroupName" \
+        --output text --region "$AWS_REGION")
+
+    if [[ "$EXISTING" == "None" || -z "$EXISTING" ]]; then
+        aws autoscaling create-auto-scaling-group \
+            --auto-scaling-group-name "$NAME" \
+            --launch-template "LaunchTemplateName=$TEMPLATE,Version=\$Latest" \
+            --min-size 1 \
+            --max-size 1 \
+            --desired-capacity 1 \
+            --vpc-zone-identifier "$SUBNET_A,$SUBNET_B" \
+            --target-group-arns "$TARGET_ARN" \
+            --health-check-type ELB \
+            --health-check-grace-period 120 \
+            --tags "ResourceId=$NAME,ResourceType=auto-scaling-group,Key=Name,Value=$APP_NAME,PropagateAtLaunch=true" \
+            --region "$AWS_REGION"
+    else
+        echo "Auto Scaling Group $NAME already exists."
+    fi
+}
+
+create_asg "$UPLOADER_ASG_NAME" "$UPLOADER_LT_NAME" "$UPLOADER_TG_ARN" "uploader-app"
+create_asg "$VIEWER_ASG_NAME" "$VIEWER_LT_NAME" "$VIEWER_TG_ARN" "viewer-app"
+
+echo "== Saving stack outputs =="
+cat > stack_outputs.env <<OUTPUTS
+VPC_ID=$VPC_ID
+SUBNET_A=$SUBNET_A
+SUBNET_B=$SUBNET_B
+ALB_SECURITY_GROUP_ID=$ALB_SECURITY_GROUP_ID
+ALB_ARN=$ALB_ARN
+ALB_DNS_NAME=$ALB_DNS_NAME
+UPLOADER_TG_ARN=$UPLOADER_TG_ARN
+VIEWER_TG_ARN=$VIEWER_TG_ARN
+OUTPUTS
+
+echo "== Deployment complete =="
+echo "Uploader: http://$ALB_DNS_NAME:$UPLOADER_LISTENER_PORT/"
+echo "Viewer:   http://$ALB_DNS_NAME:$VIEWER_LISTENER_PORT/"
+echo "Wait for both target groups to become healthy."

@@ -1,1 +1,9 @@
 .env
+.env.bak
+stack_outputs.env
+*.bak
+
+# Python virtual environments and cache
+.venv/
+__pycache__/
+*.pyc
