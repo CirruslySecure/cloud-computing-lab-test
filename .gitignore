@@ -7,3 +7,6 @@ stack_outputs.env
 .venv/
 __pycache__/
 *.pyc
+
+# Node.js dependencies
+node_modules/
