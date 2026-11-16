@@ -10,3 +10,17 @@ __pycache__/
 
 # Node.js dependencies
 node_modules/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+crash.log
+crash.*.log
+*.tfplan
+
+# Private keys and credentials
+*.pem
+*.key
